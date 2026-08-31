@@ -1,0 +1,23 @@
+# --- Data: this app is hosted, so its 5 data files ARE committed
+# (see data/ folder) - this only blocks anything else Excel/CSV-shaped
+# you might drop in elsewhere by accident, e.g. scratch files, or a
+# reintroduced per-symbol OHLC folder.
+*.xlsx
+*.xls
+*.csv
+!data/Company_News.xlsx
+!data/EQUITY_L.csv
+!data/Low_Price.xlsx
+!data/uptrend_output.xlsx
+!data/uptrend_5day.xlsx
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- OS/editor noise ---
+.DS_Store
+Thumbs.db
+.vscode/
