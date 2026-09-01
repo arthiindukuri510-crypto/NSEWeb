@@ -149,6 +149,7 @@
   .news-row-top{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }
   .news-row-company{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:12.5px; color:var(--brand); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .news-row-date{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--muted); flex-shrink:0; }
+  .news-row-tags{ display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
   .news-row-summary{ font-size:12.5px; color:#cdd3da; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 
   /* ---- quote card ---- */
@@ -369,15 +370,21 @@
       return;
     }
     countEl.textContent = list.length + ' items';
-    body.innerHTML = list.map(n=>
-      '<div class="news-row" data-key="'+escapeAttr(n.symbol || n.company)+'">' +
+    body.innerHTML = list.map(n=>{
+      const sent = (n.sentiment||'unknown').toLowerCase();
+      const cat = n.category;
+      return '<div class="news-row" data-key="'+escapeAttr(n.symbol || n.company)+'">' +
         '<div class="news-row-top">' +
           '<span class="news-row-company">'+escapeHtml(n.symbol || n.company)+'</span>' +
           '<span class="news-row-date">'+formatDate(n.date)+'</span>' +
         '</div>' +
+        '<div class="news-row-tags">' +
+          (cat ? '<span class="tag category '+cat+'">'+cat.replace(/_/g,' ')+'</span>' : '') +
+          '<span class="tag sentiment '+sent+'">'+sent+'</span>' +
+        '</div>' +
         '<div class="news-row-summary">'+escapeHtml(n.summary)+'</div>' +
-      '</div>'
-    ).join('');
+      '</div>';
+    }).join('');
     body.querySelectorAll('.news-row').forEach(el=>{
       el.addEventListener('click', ()=>{
         selectCompany(el.dataset.key);
