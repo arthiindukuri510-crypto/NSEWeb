@@ -395,7 +395,7 @@ def api_latest_news():
     records = [
         {
             "company": row["display_name"],
-            "symbol": row["symbol"],
+            "symbol": None if pd.isna(row["symbol"]) else row["symbol"],
             "date": row["date_str"],
             "summary": row["Summary"],
             "sentiment": row["Sentiment"],
