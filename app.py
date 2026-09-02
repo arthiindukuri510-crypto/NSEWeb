@@ -40,8 +40,25 @@ FILES THIS EXPECTS  (edit the CONFIG block below)
       [LAST_PRICE]. Power the "3-Day Rising" / "5-Day Rising" tables on
       the front page. Set either to None to skip.
 
+LIVE CMP (new)
+  A background thread polls Yahoo Finance's free quote endpoint every
+  POLL_INTERVAL_SECONDS for every symbol in your NSE universe (from
+  EQUITY_L.csv if present, else whatever symbols show up in
+  Low_Price.xlsx / your news entities) and pushes price updates to
+  every open browser tab over a WebSocket - no page refresh needed.
+
+  This is Yahoo's free public quote data for NSE tickers, which runs
+  about 15 minutes behind the live exchange feed - not true tick-by-
+  tick, but good enough to "just keep updating" a client demo without
+  needing a paid broker API. If you ever want true live tick data,
+  swap fetch_live_quotes() for a broker API call (Zerodha Kite
+  Connect, Upstox, etc.) - everything downstream (the socket push,
+  the frontend flash-on-change) stays the same.
+
 BEFORE YOU RUN THIS
   pip install -r requirements.txt
+  (requirements.txt needs: flask, flask-socketio, pandas, openpyxl,
+  requests - see the note at the bottom of this file)
   Drop your Excel/CSV files into the "data" folder next to this file
   (create it if it isn't there), using the filenames below - or edit
   the CONFIG block to point at wherever your files actually live.
@@ -52,11 +69,15 @@ BEFORE YOU RUN THIS
 
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 from flask import Flask, jsonify, render_template, request
+from flask_socketio import SocketIO
 
 # ======================= CONFIG - EDIT THESE =======================
 # By default everything is read from a "data" folder next to this file,
@@ -71,9 +92,18 @@ SYMBOL_MASTER_FILE  = DATA_DIR / "EQUITY_L.csv"
 LOW_PRICE_FILE      = DATA_DIR / "Low_Price.xlsx"          # set to None to skip
 TREND_3DAY_FILE     = DATA_DIR / "uptrend_output.xlsx"     # set to None to skip
 TREND_5DAY_FILE     = DATA_DIR / "uptrend_5day.xlsx"       # set to None to skip
+TREND_ALL_FILE      = DATA_DIR / "trend_output.xlsx"       # ALL companies (Up/Down/Sideways) - set to None to skip
+
+# --- live CMP polling ---
+LIVE_CMP_ENABLED     = True   # set False to fall back to the old static Low_Price.xlsx CMP only
+POLL_INTERVAL_SECONDS = 300   # how often to refresh prices (Yahoo's NSE data itself only moves ~every 15 min, so
+                               # there's little point going below ~60s - lower this only if you want the "live"
+                               # feel more than the underlying number actually changing that often)
+YAHOO_CHUNK_SIZE      = 150   # symbols per Yahoo request - keep to two-ish hundred to avoid Yahoo rejecting the call
 # ====================================================================
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 
 _GENERIC_WORDS = re.compile(r"\b(limited|ltd|company|co|corporation|corp|the|of|india)\b")
@@ -255,6 +285,12 @@ NEWS_DF, SYMBOL_TO_NAME = build_index()
 LOW_PRICE_DF = load_low_price()
 TREND_3DAY = load_trend_file(TREND_3DAY_FILE)
 TREND_5DAY = load_trend_file(TREND_5DAY_FILE)
+TREND_ALL = load_trend_file(TREND_ALL_FILE)
+
+# symbol -> {trend, support_high, support_low, cmp} for the small
+# Up/Down/Sideways badge shown next to a searched company's price -
+# this is a lookup, not a browsable list
+TREND_BY_SYMBOL = {row["symbol"]: row for row in (TREND_ALL or [])}
 
 # one row per entity: entity_key, display_name, symbol, article count
 ENTITIES = (
@@ -293,11 +329,102 @@ def get_price_quote(symbol):
     if not symbol or LOW_PRICE_DF is None or symbol not in LOW_PRICE_DF.index:
         return None
     row = LOW_PRICE_DF.loc[symbol]
+    live = LIVE_CMP.get(symbol)
     return {
-        "cmp": row.get("LAST_PRICE"),
+        # prefer the live-polled price; fall back to the static
+        # Low_Price.xlsx snapshot for symbols Yahoo has no quote for
+        # yet (just started, delisted, illiquid, etc.)
+        "cmp": live if live is not None else row.get("LAST_PRICE"),
         "low_5day": row.get("5Day_Low"),
         "low_20day": row.get("20Day_Low"),
     }
+
+
+def get_trend_badge(symbol):
+    """Small Up/Down/Sideways badge info for a searched company, from
+    trend_output.xlsx - just a lookup, not the full company list."""
+    if not symbol:
+        return None
+    row = TREND_BY_SYMBOL.get(symbol)
+    if not row:
+        return None
+    raw = str(row.get("trend") or "").strip()
+    letter = raw[:1].upper()
+    direction = {"U": "up", "D": "down"}.get(letter, "side")
+    label = re.sub(r"^[A-Z]\s*", "", raw).strip()  # e.g. "▲ UpTrend"
+    return {"direction": direction, "label": label}
+
+
+# --------------------------------- live CMP polling ---------------------------------
+
+LIVE_CMP = {}          # symbol -> latest price we've fetched from Yahoo
+_LIVE_CMP_LOCK = threading.Lock()
+
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NSECompanyTerminal/1.0)"}
+
+
+def build_symbol_universe():
+    """Every NSE symbol we know about, in priority order: the full NSE
+    master list (EQUITY_L.csv) if we have it - since that's the
+    complete ~2700-company universe - otherwise whatever symbols show
+    up in Low_Price.xlsx or the news entities."""
+    symbols = set()
+    if SYMBOL_TO_NAME:
+        symbols.update(SYMBOL_TO_NAME.keys())
+    if LOW_PRICE_DF is not None:
+        symbols.update(LOW_PRICE_DF.index.tolist())
+    for e in ENTITIES:
+        if e["symbol"]:
+            symbols.add(e["symbol"])
+    if TREND_ALL:
+        symbols.update(row["symbol"] for row in TREND_ALL if row.get("symbol"))
+    return sorted(s for s in symbols if s)
+
+
+def fetch_live_quotes(symbols):
+    """Batch-fetch current prices for a list of NSE symbols from
+    Yahoo Finance's free quote endpoint (symbol.NS). Returns
+    {symbol: price} for whichever symbols Yahoo actually returned a
+    price for - missing/unknown symbols are just left out."""
+    quotes = {}
+    for i in range(0, len(symbols), YAHOO_CHUNK_SIZE):
+        chunk = symbols[i:i + YAHOO_CHUNK_SIZE]
+        yahoo_symbols = [s + ".NS" for s in chunk]
+        try:
+            resp = requests.get(
+                YAHOO_QUOTE_URL,
+                params={"symbols": ",".join(yahoo_symbols)},
+                headers=_YAHOO_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("quoteResponse", {}).get("result", []):
+                sym = str(item.get("symbol", "")).replace(".NS", "")
+                price = item.get("regularMarketPrice")
+                if sym and price is not None:
+                    quotes[sym] = price
+        except Exception as e:
+            print(f"[warn] live CMP fetch failed for a batch of {len(chunk)} symbol(s): {e}")
+        time.sleep(0.3)  # be polite between batches
+    return quotes
+
+
+def poll_live_cmp_forever():
+    universe = build_symbol_universe()
+    if not universe:
+        print("[warn] LIVE_CMP_ENABLED but no symbols found to poll - check SYMBOL_MASTER_FILE/LOW_PRICE_FILE")
+        return
+    print(f"[live-cmp] polling {len(universe)} symbol(s) every {POLL_INTERVAL_SECONDS}s")
+    while True:
+        new_quotes = fetch_live_quotes(universe)
+        if new_quotes:
+            with _LIVE_CMP_LOCK:
+                LIVE_CMP.update(new_quotes)
+            socketio.emit("price_update", {"prices": new_quotes})
+            print(f"[live-cmp] pushed {len(new_quotes)} updated price(s)")
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 # --------------------------------- routes ---------------------------------
@@ -351,12 +478,14 @@ def api_news(query):
     ]
 
     quote = get_price_quote(symbol)
+    trend = get_trend_badge(symbol)
 
     return jsonify({
         "company": entity["display_name"],
         "symbol": symbol,
         "news": news_records,
         "quote": quote,
+        "trend": trend,
     })
 
 
@@ -407,10 +536,14 @@ def api_latest_news():
 
 
 if __name__ == "__main__":
+    if LIVE_CMP_ENABLED:
+        socketio.start_background_task(poll_live_cmp_forever)
+
     # Render (and most hosts) set PORT for you and expect the app to
     # bind 0.0.0.0. debug=True is a security risk on a public server
     # (it exposes a live Python console on error pages), so it's off
     # whenever PORT is set - i.e. whenever this is actually deployed.
+    # socketio.run replaces app.run so the WebSocket server starts too.
     port = int(os.environ.get("PORT", 5000))
     is_hosted = "PORT" in os.environ
-    app.run(host="0.0.0.0", port=port, debug=not is_hosted)
+    socketio.run(app, host="0.0.0.0", port=port, debug=not is_hosted, allow_unsafe_werkzeug=True)
