@@ -129,6 +129,8 @@
   .trend-table .sym{ font-weight:600; color:var(--text); }
   .trend-table .cname{ display:block; font-family:'Inter',sans-serif; font-size:11px; color:var(--muted); margin-top:2px; }
   .trend-table .cmp-val{ color:var(--accent); }
+  .trend-table .cmp-val.flash-up{ animation:flashUp .9s ease; }
+  .trend-table .cmp-val.flash-down{ animation:flashDown .9s ease; }
 
   .trend-row{
     display:flex; align-items:center; justify-content:space-between; gap:10px;
@@ -161,8 +163,28 @@
   .quote-top{ display:flex; align-items:flex-end; justify-content:space-between; flex-wrap:wrap; gap:16px; }
   .quote-name{ font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:22px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .quote-name .sym-badge{ font-size:13px; padding:2px 9px; }
-  .quote-cmp{ font-family:'IBM Plex Mono',monospace; font-size:30px; font-weight:600; text-align:right; }
-  .quote-note{ color:var(--muted); font-size:12.5px; margin-top:10px; font-family:'IBM Plex Mono',monospace; }
+  .quote-cmp{ font-family:'IBM Plex Mono',monospace; font-size:30px; font-weight:600; text-align:right; transition:color .3s ease; }
+  .quote-cmp.flash-up{ animation:flashUp 1s ease; }
+  .quote-cmp.flash-down{ animation:flashDown 1s ease; }
+  .quote-note{ color:var(--muted); font-size:12.5px; margin-top:10px; font-family:'IBM Plex Mono',monospace; display:flex; align-items:center; gap:6px; }
+  .live-dot{ width:7px; height:7px; border-radius:50%; background:var(--accent); display:inline-block; box-shadow:0 0 0 0 rgba(61,220,151,0.5); animation:pulse 2s infinite; }
+  .live-dot.stale{ background:var(--muted); box-shadow:none; animation:none; }
+
+  .trend-badge{
+    font-family:'IBM Plex Mono',monospace; font-size:12px; font-weight:600; letter-spacing:0.02em;
+    padding:3px 10px; border-radius:999px; border:1px solid transparent; white-space:nowrap;
+  }
+  .trend-badge.up{ color:var(--accent); border-color:var(--accent); background:rgba(61,220,151,0.10); }
+  .trend-badge.down{ color:var(--neg); border-color:var(--neg); background:rgba(255,93,93,0.10); }
+  .trend-badge.side{ color:var(--neu); border-color:var(--neu); background:rgba(240,180,41,0.10); }
+
+  @keyframes pulse{
+    0%{ box-shadow:0 0 0 0 rgba(61,220,151,0.5); }
+    70%{ box-shadow:0 0 0 6px rgba(61,220,151,0); }
+    100%{ box-shadow:0 0 0 0 rgba(61,220,151,0); }
+  }
+  @keyframes flashUp{ 0%{ background:rgba(61,220,151,0.22); } 100%{ background:transparent; } }
+  @keyframes flashDown{ 0%{ background:rgba(255,93,93,0.22); } 100%{ background:transparent; } }
 
   .stat-row{ display:flex; gap:14px; margin-top:18px; flex-wrap:wrap; }
   .stat{ background:#0f1420; border:1px solid var(--line); border-radius:10px; padding:11px 16px; flex:1; min-width:130px; }
@@ -274,10 +296,13 @@
 
   <footer id="footerLine"></footer>
 
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
 (function(){
   let currentMatches = [];
   let activeIndex = -1;
+  let currentSymbol = null;   // symbol of the company currently shown in the quote card
+  const liveCmpBySymbol = {}; // latest live price we've received per symbol, kept for late-rendered rows
 
   const qEl = document.getElementById('q');
   const suggestEl = document.getElementById('suggest');
@@ -310,6 +335,7 @@
     qEl.value = '';
     suggestEl.classList.remove('show');
     document.body.classList.remove('search-active');
+    currentSymbol = null;
     showIntro();
   }
   clearBtn.addEventListener('click', closeSearch);
@@ -337,7 +363,8 @@
     }
     countEl.textContent = data.rows.length + ' stocks';
     const rowsHtml = data.rows.map((r,i)=>{
-      const cmp = fmtNum(r.cmp !== null && r.cmp !== undefined ? r.cmp : r.last_price);
+      const liveVal = liveCmpBySymbol[r.symbol];
+      const cmp = fmtNum(liveVal !== undefined ? liveVal : (r.cmp !== null && r.cmp !== undefined ? r.cmp : r.last_price));
       const trendLabel = (r.trend || 'UpTrend').replace(/^[A-Z]\s*/, '').trim();
       return '<tr data-key="'+escapeAttr(r.symbol)+'">' +
         '<td>'+(i+1)+'</td>' +
@@ -345,7 +372,7 @@
         '<td>▲ '+escapeHtml(trendLabel || 'UpTrend')+'</td>' +
         '<td class="num">'+fmtNum(r.support_high)+'</td>' +
         '<td class="num">'+fmtNum(r.support_low)+'</td>' +
-        '<td class="num cmp-val">'+cmp+'</td>' +
+        '<td class="num cmp-val" data-symbol="'+escapeAttr(r.symbol)+'">'+cmp+'</td>' +
         '<td class="num">'+fmtNum(r.last_price)+'</td>' +
       '</tr>';
     }).join('');
@@ -514,19 +541,36 @@
     const name = data.company;
     const symbol = data.symbol;
     const list = data.news || [];
+    currentSymbol = symbol || null;
 
     let quoteHtml = '';
+    const trend = data.trend;
+    const trendBadgeHtml = trend
+      ? '<span class="trend-badge '+trend.direction+'">'+escapeHtml(trend.label)+'</span>'
+      : '';
     if(data.quote){
       const q = data.quote;
+      const liveVal = symbol && liveCmpBySymbol[symbol];
+      const cmpToShow = liveVal !== undefined ? liveVal : q.cmp;
       quoteHtml =
-        '<div class="quote-card show">' +
+        '<div class="quote-card show" data-symbol="'+escapeAttr(symbol||'')+'">' +
           '<div class="quote-top">' +
-            '<div class="quote-name">'+escapeHtml(name)+(symbol ? ' <span class="sym-badge">'+escapeHtml(symbol)+'</span>' : '')+'</div>' +
-            '<div class="quote-cmp">'+fmtNum(q.cmp)+'</div>' +
+            '<div class="quote-name">'+escapeHtml(name)+(symbol ? ' <span class="sym-badge">'+escapeHtml(symbol)+'</span>' : '')+(trendBadgeHtml ? ' '+trendBadgeHtml : '')+'</div>' +
+            '<div class="quote-cmp" id="quoteCmpValue">'+fmtNum(cmpToShow)+'</div>' +
           '</div>' +
           '<div class="stat-row">' +
             '<div class="stat"><div class="label">5-Day Low</div><div class="value">'+fmtNum(q.low_5day)+'</div></div>' +
             '<div class="stat"><div class="label">20-Day Low</div><div class="value">'+fmtNum(q.low_20day)+'</div></div>' +
+          '</div>' +
+          '<div class="quote-note"><span class="live-dot" id="liveDot"></span><span id="liveNote">Live price (~15 min delayed)</span></div>' +
+        '</div>';
+    } else if(trendBadgeHtml){
+      // no price data for this symbol, but we do have a trend - still
+      // show a small badge so it's not lost
+      quoteHtml =
+        '<div class="quote-card show" data-symbol="'+escapeAttr(symbol||'')+'">' +
+          '<div class="quote-top">' +
+            '<div class="quote-name">'+escapeHtml(name)+(symbol ? ' <span class="sym-badge">'+escapeHtml(symbol)+'</span>' : '')+' '+trendBadgeHtml+'</div>' +
           '</div>' +
         '</div>';
     }
@@ -568,6 +612,61 @@
     return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
   function escapeAttr(s){ return escapeHtml(s); }
+
+  // ---- live CMP over WebSocket ----
+  // Server pushes a batch of {symbol: price} every poll cycle (see
+  // POLL_INTERVAL_SECONDS in app.py). We only ever update numbers
+  // already on screen - never trigger a re-render/reflow - so this
+  // never disturbs scroll position or an open news feed.
+  const socket = io();
+
+  socket.on('price_update', (payload)=>{
+    const prices = payload.prices || {};
+    for(const symbol in prices){
+      liveCmpBySymbol[symbol] = prices[symbol];
+    }
+
+    // 1) the big quote-card CMP, if the company currently open has a live price
+    if(currentSymbol && prices.hasOwnProperty(currentSymbol)){
+      const el = document.getElementById('quoteCmpValue');
+      if(el){
+        const oldVal = parseFloat((el.textContent||'').replace(/,/g,''));
+        const newVal = prices[currentSymbol];
+        el.textContent = fmtNum(newVal);
+        flashChange(el, oldVal, newVal);
+      }
+    }
+
+    // 2) any visible trend-table CMP cells for symbols that just updated
+    document.querySelectorAll('.cmp-val[data-symbol]').forEach(cell=>{
+      const sym = cell.dataset.symbol;
+      if(prices.hasOwnProperty(sym)){
+        const oldVal = parseFloat((cell.textContent||'').replace(/,/g,''));
+        const newVal = prices[sym];
+        cell.textContent = fmtNum(newVal);
+        flashChange(cell, oldVal, newVal);
+      }
+    });
+  });
+
+  socket.on('connect', ()=>{
+    const dot = document.getElementById('liveDot');
+    if(dot) dot.classList.remove('stale');
+  });
+  socket.on('disconnect', ()=>{
+    const dot = document.getElementById('liveDot');
+    const note = document.getElementById('liveNote');
+    if(dot) dot.classList.add('stale');
+    if(note) note.textContent = 'Live feed disconnected - showing last known price';
+  });
+
+  function flashChange(el, oldVal, newVal){
+    el.classList.remove('flash-up','flash-down');
+    if(!Number.isNaN(oldVal) && !Number.isNaN(newVal) && newVal !== oldVal){
+      void el.offsetWidth; // restart animation
+      el.classList.add(newVal > oldVal ? 'flash-up' : 'flash-down');
+    }
+  }
 })();
 </script>
 </body>
