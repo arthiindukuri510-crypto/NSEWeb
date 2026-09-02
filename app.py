@@ -40,7 +40,7 @@ FILES THIS EXPECTS  (edit the CONFIG block below)
       [LAST_PRICE]. Power the "3-Day Rising" / "5-Day Rising" tables on
       the front page. Set either to None to skip.
 
-LIVE CMP (new)
+LIVE CMP
   A background thread polls Yahoo Finance's free quote endpoint every
   POLL_INTERVAL_SECONDS for every symbol in your NSE universe (from
   EQUITY_L.csv if present, else whatever symbols show up in
@@ -55,10 +55,38 @@ LIVE CMP (new)
   Connect, Upstox, etc.) - everything downstream (the socket push,
   the frontend flash-on-change) stays the same.
 
-BEFORE YOU RUN THIS
+DEPLOYMENT NOTE (Render / gunicorn)
+  This app uses Flask-SocketIO for the live-price WebSocket push, which
+  needs an async-friendly worker. A few things matter for that to work
+  once you're behind gunicorn instead of `python app.py`:
+
+    1. `gevent.monkey.patch_all()` must run before anything else imports
+       (threading, requests, etc.) - it's the very first thing this
+       file does, below - so those libraries become green-thread aware
+       under gevent. (This app originally targeted eventlet, but
+       gunicorn 26+ dropped the eventlet worker entirely - eventlet
+       itself is now deprecated upstream too - so this uses gevent +
+       gevent-websocket instead, which gunicorn still ships proper
+       WebSocket support for.)
+    2. The background poller is started at *import time* (module level,
+       guarded by `_background_started`), not inside
+       `if __name__ == "__main__":` - gunicorn imports this module and
+       calls the `app`/`socketio` objects directly, it never executes
+       that `__main__` block, so anything that used to live only there
+       (like starting the poll thread) would silently never run.
+
+  Start command on Render:
+      gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app
+  (Use exactly 1 worker - Flask-SocketIO + gevent needs a message queue
+  like Redis to coordinate WebSocket state across more than one worker
+  process; -w 1 sidesteps that entirely for a demo-scale app.)
+
+  requirements.txt needs: flask, flask-socketio, gevent, gevent-websocket,
+  pandas, openpyxl, requests, gunicorn - see requirements.txt alongside
+  this file.
+
+BEFORE YOU RUN THIS LOCALLY
   pip install -r requirements.txt
-  (requirements.txt needs: flask, flask-socketio, pandas, openpyxl,
-  requests - see the note at the bottom of this file)
   Drop your Excel/CSV files into the "data" folder next to this file
   (create it if it isn't there), using the filenames below - or edit
   the CONFIG block to point at wherever your files actually live.
@@ -66,6 +94,14 @@ BEFORE YOU RUN THIS
   python app.py
   -> open http://127.0.0.1:5000 in a browser
 """
+
+# gevent's monkey-patch MUST happen before anything else imports
+# threading/socket/requests etc, or Flask-SocketIO's gevent worker
+# ends up mixing real OS threads with green threads and you get
+# hangs/deadlocks that are miserable to debug. This has to be the
+# first executable line in the whole module.
+import gevent.monkey
+gevent.monkey.patch_all()
 
 import os
 import re
@@ -103,7 +139,7 @@ YAHOO_CHUNK_SIZE      = 150   # symbols per Yahoo request - keep to two-ish hund
 # ====================================================================
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 
 _GENERIC_WORDS = re.compile(r"\b(limited|ltd|company|co|corporation|corp|the|of|india)\b")
@@ -146,8 +182,8 @@ def load_symbol_master():
 def load_news_sentiment():
     """Company_News.xlsx -> forward-filled company name, normalized
     sentiment/summary/category. This is the required, base news source
-    - Category now comes straight from this file (Penalty / Dividend /
-    AGM or EGM / Financial Results / Others), normalized to
+    - Category now comes straight from this file (Penalty / Dividend
+    / AGM or EGM / Financial Results / Others), normalized to
     underscore-separated so it's a safe, consistent CSS class name
     (e.g. "AGM or EGM" -> "AGM_or_EGM")."""
     df = pd.read_excel(NEWS_FILE)
@@ -535,10 +571,19 @@ def api_latest_news():
     return jsonify(records)
 
 
-if __name__ == "__main__":
-    if LIVE_CMP_ENABLED:
-        socketio.start_background_task(poll_live_cmp_forever)
+# --------------------------- start the background poller ---------------------------
+# This runs at *import time*, not inside `if __name__ == "__main__":`, so it
+# fires whether the app is launched with `python app.py` (dev) or with
+# `gunicorn -k eventlet -w 1 app:app` (Render/production) - gunicorn imports
+# this module and never executes the __main__ block below, so anything the
+# live-price feature needs has to be started here instead.
+_background_started = False
+if LIVE_CMP_ENABLED and not _background_started:
+    socketio.start_background_task(poll_live_cmp_forever)
+    _background_started = True
 
+
+if __name__ == "__main__":
     # Render (and most hosts) set PORT for you and expect the app to
     # bind 0.0.0.0. debug=True is a security risk on a public server
     # (it exposes a live Python console on error pages), so it's off
