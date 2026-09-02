@@ -464,12 +464,28 @@
       return;
     }
     clearTimeout(debounceTimer);
+    // show something immediately instead of leaving the dropdown blank
+    // while we wait - a slow response now has a visible state instead
+    // of just looking broken
+    suggestEl.innerHTML = '<div class="suggest-empty">Searching…</div>';
+    suggestEl.classList.add('show');
+    const searchToken = val; // guards against an older, slower request overwriting a newer one
     debounceTimer = setTimeout(()=>{
       fetch('/api/companies?q=' + encodeURIComponent(val))
-        .then(r=>r.json())
+        .then(r=>{
+          if(!r.ok) throw new Error('search request failed: ' + r.status);
+          return r.json();
+        })
         .then(matches=>{
+          if(qEl.value.trim() !== searchToken) return; // stale response, user kept typing
           currentMatches = matches;
           renderSuggest(matches, val);
+        })
+        .catch(err=>{
+          if(qEl.value.trim() !== searchToken) return;
+          console.error('company search failed:', err);
+          suggestEl.innerHTML = '<div class="suggest-empty">Search is taking longer than usual — try again in a moment.</div>';
+          suggestEl.classList.add('show');
         });
     }, 120);
   });
