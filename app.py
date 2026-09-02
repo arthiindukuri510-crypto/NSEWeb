@@ -401,18 +401,23 @@ _YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NSECompanyTerminal/1.0
 
 
 def build_symbol_universe():
-    """Every NSE symbol we know about, in priority order: the full NSE
-    master list (EQUITY_L.csv) if we have it - since that's the
-    complete ~2700-company universe - otherwise whatever symbols show
-    up in Low_Price.xlsx or the news entities."""
+    """Only the symbols the UI can actually show a live price for:
+    everything in Low_Price.xlsx (powers the quote-card CMP) plus
+    everything in trend_output.xlsx (powers the trend-table CMP
+    columns). A symbol that isn't in either of those never renders a
+    live-updatable price cell, so polling it would be pure overhead.
+
+    This used to also pull in the entire EQUITY_L.csv master list
+    (~2000-2700 symbols) "just in case" - that's what was making the
+    background poller do a huge batch of outbound Yahoo requests every
+    cycle, all running in the same single-worker event loop that also
+    answers the search box, which is why search got slow/unresponsive
+    around each poll. Keeping the universe to only what's actually
+    displayed keeps that background work small enough to not compete
+    with normal requests."""
     symbols = set()
-    if SYMBOL_TO_NAME:
-        symbols.update(SYMBOL_TO_NAME.keys())
     if LOW_PRICE_DF is not None:
         symbols.update(LOW_PRICE_DF.index.tolist())
-    for e in ENTITIES:
-        if e["symbol"]:
-            symbols.add(e["symbol"])
     if TREND_ALL:
         symbols.update(row["symbol"] for row in TREND_ALL if row.get("symbol"))
     return sorted(s for s in symbols if s)
