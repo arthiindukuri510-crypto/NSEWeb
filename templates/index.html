@@ -86,6 +86,15 @@
 
   main{ max-width:800px; margin:0 auto; padding:16px 24px 24px; min-height:20px; }
 
+  /* ---- back-to-overview button (shown at the top of a company/news result) ---- */
+  .back-row{ margin-bottom:16px; }
+  .back-btn{
+    display:inline-flex; align-items:center; gap:7px; font-family:'IBM Plex Mono',monospace;
+    font-size:13px; color:var(--muted); background:var(--panel); border:1px solid var(--line);
+    border-radius:9px; padding:8px 14px; cursor:pointer; transition:all .12s ease; user-select:none;
+  }
+  .back-btn:hover{ color:var(--text); border-color:var(--brand); }
+
   /* ---- dashboard: 3-day / 5-day rising + latest news, tabbed ---- */
   .dash-wrap{ max-width:1180px; margin:0 auto; padding:0 24px 8px; }
 
@@ -337,6 +346,7 @@
     document.body.classList.remove('search-active');
     currentSymbol = null;
     showIntro();
+    window.scrollTo({top:0, behavior:'smooth'});
   }
   clearBtn.addEventListener('click', closeSearch);
 
@@ -537,6 +547,24 @@
     return num.toLocaleString('en-IN', {maximumFractionDigits:2});
   }
 
+  // small "← Back to overview" pill shown at the top of every
+  // company/news result, so there's an obvious way back besides the
+  // tiny ✕ in the search box - especially important when a result was
+  // opened by clicking a Latest News item rather than by typing.
+  function backButtonHtml(){
+    return '<div class="back-row">' +
+      '<span class="back-btn" id="backToOverviewBtn">' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>' +
+        'Back to overview' +
+      '</span>' +
+    '</div>';
+  }
+
+  function wireBackButton(){
+    const btn = document.getElementById('backToOverviewBtn');
+    if(btn) btn.addEventListener('click', closeSearch);
+  }
+
   function renderResults(data){
     const name = data.company;
     const symbol = data.symbol;
@@ -576,7 +604,8 @@
     }
 
     if(!list.length){
-      main.innerHTML = quoteHtml + '<div class="empty-state">No news found for “'+escapeHtml(name)+'”.</div>';
+      main.innerHTML = backButtonHtml() + quoteHtml + '<div class="empty-state">No news found for “'+escapeHtml(name)+'”.</div>';
+      wireBackButton();
       return;
     }
 
@@ -594,12 +623,13 @@
       '</div>';
     }).join('');
 
-    main.innerHTML = quoteHtml +
+    main.innerHTML = backButtonHtml() + quoteHtml +
       '<div class="result-head">' +
         '<h2>Latest news</h2>' +
         '<span class="result-count">'+list.length+' article'+(list.length===1?'':'s')+' · latest → oldest</span>' +
       '</div>' +
       '<div class="feed">'+cards+'</div>';
+    wireBackButton();
   }
 
   function formatDate(iso){
