@@ -42,10 +42,15 @@ FILES THIS EXPECTS  (edit the CONFIG block below)
 
 LIVE CMP
   A background thread polls Yahoo Finance's free quote endpoint every
-  POLL_INTERVAL_SECONDS for every symbol in your NSE universe (from
-  EQUITY_L.csv if present, else whatever symbols show up in
-  Low_Price.xlsx / your news entities) and pushes price updates to
-  every open browser tab over a WebSocket - no page refresh needed.
+  POLL_INTERVAL_SECONDS - but ONLY for symbols actually visible right
+  now: the 3-day/5-day rising tables, plus whichever companies someone
+  has looked up recently (see WATCHED_SYMBOL_TTL_SECONDS below). It
+  pushes price updates to every open browser tab over a WebSocket - no
+  page refresh needed.
+
+  A company that's just been searched but isn't in either rising table
+  gets its price fetched on demand, right in that request, instead of
+  waiting for the next background sweep - see get_price_quote().
 
   This is Yahoo's free public quote data for NSE tickers, which runs
   about 15 minutes behind the live exchange feed - not true tick-by-
@@ -136,9 +141,15 @@ POLL_INTERVAL_SECONDS = 300   # how often to refresh prices (Yahoo's NSE data it
                                # there's little point going below ~60s - lower this only if you want the "live"
                                # feel more than the underlying number actually changing that often)
 YAHOO_CHUNK_SIZE      = 150   # symbols per Yahoo request - keep to two-ish hundred to avoid Yahoo rejecting the call
+WATCHED_SYMBOL_TTL_SECONDS = 900   # a searched company stays in the background poll for 15 min after being viewed
+ON_DEMAND_FETCH_TIMEOUT = 5    # seconds - keep short so an unresponsive Yahoo call never stalls a page load
 # ====================================================================
 
 app = Flask(__name__)
+# async_mode left unset so flask-socketio auto-picks the best available:
+# eventlet if it's installed (needed for gunicorn + WebSockets on Render -
+# see the __main__ block below), otherwise falls back to plain threading
+# for local `python app.py` runs.
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 
@@ -182,8 +193,8 @@ def load_symbol_master():
 def load_news_sentiment():
     """Company_News.xlsx -> forward-filled company name, normalized
     sentiment/summary/category. This is the required, base news source
-    - Category now comes straight from this file (Penalty / Dividend
-    / AGM or EGM / Financial Results / Others), normalized to
+    - Category now comes straight from this file (Penalty / Dividend /
+    AGM or EGM / Financial Results / Others), normalized to
     underscore-separated so it's a safe, consistent CSS class name
     (e.g. "AGM or EGM" -> "AGM_or_EGM")."""
     df = pd.read_excel(NEWS_FILE)
@@ -365,11 +376,26 @@ def get_price_quote(symbol):
     if not symbol or LOW_PRICE_DF is None or symbol not in LOW_PRICE_DF.index:
         return None
     row = LOW_PRICE_DF.loc[symbol]
-    live = LIVE_CMP.get(symbol)
+
+    now = time.time()
+    with _LIVE_CMP_LOCK:
+        RECENTLY_VIEWED[symbol] = now  # keeps this symbol in the background poll for a while
+        live = LIVE_CMP.get(symbol)
+
+    if live is None:
+        # nobody's polled this one yet in this process - fetch it right
+        # now instead of making the page wait for the next background
+        # sweep. Short timeout, so a slow Yahoo response never stalls
+        # the page for more than ON_DEMAND_FETCH_TIMEOUT seconds.
+        live = fetch_live_quote_single(symbol)
+        if live is not None:
+            with _LIVE_CMP_LOCK:
+                LIVE_CMP[symbol] = live
+
     return {
-        # prefer the live-polled price; fall back to the static
-        # Low_Price.xlsx snapshot for symbols Yahoo has no quote for
-        # yet (just started, delisted, illiquid, etc.)
+        # prefer the live price; fall back to the static Low_Price.xlsx
+        # snapshot if Yahoo has nothing for this symbol (just started,
+        # delisted, illiquid, or the on-demand fetch above failed/timed out)
         "cmp": live if live is not None else row.get("LAST_PRICE"),
         "low_5day": row.get("5Day_Low"),
         "low_20day": row.get("20Day_Low"),
@@ -394,6 +420,7 @@ def get_trend_badge(symbol):
 # --------------------------------- live CMP polling ---------------------------------
 
 LIVE_CMP = {}          # symbol -> latest price we've fetched from Yahoo
+RECENTLY_VIEWED = {}   # symbol -> epoch time it was last looked up (keeps it in the background poll for a while)
 _LIVE_CMP_LOCK = threading.Lock()
 
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
@@ -401,25 +428,34 @@ _YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NSECompanyTerminal/1.0
 
 
 def build_symbol_universe():
-    """Only the symbols the UI can actually show a live price for:
-    everything in Low_Price.xlsx (powers the quote-card CMP) plus
-    everything in trend_output.xlsx (powers the trend-table CMP
-    columns). A symbol that isn't in either of those never renders a
-    live-updatable price cell, so polling it would be pure overhead.
+    """Only the symbols that actually need a *background-refreshed*
+    live price right now: the 3-day/5-day rising tables (shown to
+    every visitor, several rows at once, worth a periodic bulk
+    refresh), plus whichever companies someone has looked up in the
+    last WATCHED_SYMBOL_TTL_SECONDS (so a company someone has open
+    keeps updating live for a while, without needing every one of the
+    ~2700 NSE companies polled just in case someone looks at it).
 
-    This used to also pull in the entire EQUITY_L.csv master list
-    (~2000-2700 symbols) "just in case" - that's what was making the
-    background poller do a huge batch of outbound Yahoo requests every
-    cycle, all running in the same single-worker event loop that also
-    answers the search box, which is why search got slow/unresponsive
-    around each poll. Keeping the universe to only what's actually
-    displayed keeps that background work small enough to not compete
-    with normal requests."""
+    This used to pull in the ENTIRE company universe (EQUITY_L.csv, or
+    later Low_Price.xlsx + trend_output.xlsx - both of which also cover
+    ~2700-2765 companies) every single cycle. That meant ~19 chunked
+    Yahoo requests every 5 minutes for companies nobody was even
+    looking at, which was competing for CPU/network with real visitor
+    requests on a free-tier host and is what made the site feel slow/
+    unresponsive. A specific company you search for now gets its price
+    fetched on demand instead (see get_price_quote()), so nothing has
+    to wait for a background sweep to reach it."""
     symbols = set()
-    if LOW_PRICE_DF is not None:
-        symbols.update(LOW_PRICE_DF.index.tolist())
-    if TREND_ALL:
-        symbols.update(row["symbol"] for row in TREND_ALL if row.get("symbol"))
+    if TREND_3DAY:
+        symbols.update(row["symbol"] for row in TREND_3DAY if row.get("symbol"))
+    if TREND_5DAY:
+        symbols.update(row["symbol"] for row in TREND_5DAY if row.get("symbol"))
+    now = time.time()
+    with _LIVE_CMP_LOCK:
+        symbols.update(
+            sym for sym, last_seen in RECENTLY_VIEWED.items()
+            if now - last_seen < WATCHED_SYMBOL_TTL_SECONDS
+        )
     return sorted(s for s in symbols if s)
 
 
@@ -452,19 +488,42 @@ def fetch_live_quotes(symbols):
     return quotes
 
 
+def fetch_live_quote_single(symbol, timeout=ON_DEMAND_FETCH_TIMEOUT):
+    """One-symbol version of fetch_live_quotes(), used for an on-demand
+    lookup when someone searches a company that isn't already in
+    LIVE_CMP from the background sweep. Kept to a short timeout so a
+    slow/unreachable Yahoo call can never stall a page load for long -
+    on any failure we just return None and the caller falls back to
+    the static Low_Price.xlsx value."""
+    try:
+        resp = requests.get(
+            YAHOO_QUOTE_URL,
+            params={"symbols": symbol + ".NS"},
+            headers=_YAHOO_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("quoteResponse", {}).get("result", [])
+        if results:
+            price = results[0].get("regularMarketPrice")
+            if price is not None:
+                return price
+    except Exception as e:
+        print(f"[warn] on-demand live CMP fetch failed for {symbol}: {e}")
+    return None
+
+
 def poll_live_cmp_forever():
-    universe = build_symbol_universe()
-    if not universe:
-        print("[warn] LIVE_CMP_ENABLED but no symbols found to poll - check SYMBOL_MASTER_FILE/LOW_PRICE_FILE")
-        return
-    print(f"[live-cmp] polling {len(universe)} symbol(s) every {POLL_INTERVAL_SECONDS}s")
     while True:
-        new_quotes = fetch_live_quotes(universe)
-        if new_quotes:
-            with _LIVE_CMP_LOCK:
-                LIVE_CMP.update(new_quotes)
-            socketio.emit("price_update", {"prices": new_quotes})
-            print(f"[live-cmp] pushed {len(new_quotes)} updated price(s)")
+        universe = build_symbol_universe()
+        if universe:
+            new_quotes = fetch_live_quotes(universe)
+            if new_quotes:
+                with _LIVE_CMP_LOCK:
+                    LIVE_CMP.update(new_quotes)
+                socketio.emit("price_update", {"prices": new_quotes})
+                print(f"[live-cmp] pushed {len(new_quotes)} updated price(s) for {len(universe)} watched symbol(s)")
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -579,9 +638,10 @@ def api_latest_news():
 # --------------------------- start the background poller ---------------------------
 # This runs at *import time*, not inside `if __name__ == "__main__":`, so it
 # fires whether the app is launched with `python app.py` (dev) or with
-# `gunicorn -k eventlet -w 1 app:app` (Render/production) - gunicorn imports
-# this module and never executes the __main__ block below, so anything the
-# live-price feature needs has to be started here instead.
+# `gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app`
+# (Render/production) - gunicorn imports this module and never executes the
+# __main__ block below, so anything the live-price feature needs has to be
+# started here instead.
 _background_started = False
 if LIVE_CMP_ENABLED and not _background_started:
     socketio.start_background_task(poll_live_cmp_forever)
