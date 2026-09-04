@@ -6,4 +6,3 @@ pandas
 openpyxl
 requests
 gunicorn
-eventlet
