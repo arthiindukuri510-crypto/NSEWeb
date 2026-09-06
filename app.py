@@ -32,6 +32,10 @@ FILES THIS EXPECTS  (edit the CONFIG block below)
   LOW_PRICE_FILE (optional) - Low_Price.xlsx
       columns: SYMBOL, LAST_PRICE, 5Day_Low, 20Day_Low
       Powers the CMP / 5-day low / 20-day low stat row. Set to None to skip.
+      CMP shown to the user is simply LAST_PRICE from this file - no
+      live/streaming price lookup. Refresh this file (and restart the
+      app, or re-run whatever regenerates it) whenever you want newer
+      prices to show up.
 
   TREND_3DAY_FILE / TREND_5DAY_FILE (optional) - uptrend_output.xlsx /
       uptrend_5day.xlsx (output of your trend_uptrend_only.py /
@@ -39,56 +43,6 @@ FILES THIS EXPECTS  (edit the CONFIG block below)
       columns: SYMBOL, DATE, TREND, SUPPORT_HIGH, SUPPORT_LOW, CMP,
       [LAST_PRICE]. Power the "3-Day Rising" / "5-Day Rising" tables on
       the front page. Set either to None to skip.
-
-LIVE CMP
-  A background thread polls Yahoo Finance's free quote endpoint every
-  POLL_INTERVAL_SECONDS - but ONLY for symbols actually visible right
-  now: the 3-day/5-day rising tables, plus whichever companies someone
-  has looked up recently (see WATCHED_SYMBOL_TTL_SECONDS below). It
-  pushes price updates to every open browser tab over a WebSocket - no
-  page refresh needed.
-
-  A company that's just been searched but isn't in either rising table
-  gets its price fetched on demand, right in that request, instead of
-  waiting for the next background sweep - see get_price_quote().
-
-  This is Yahoo's free public quote data for NSE tickers, which runs
-  about 15 minutes behind the live exchange feed - not true tick-by-
-  tick, but good enough to "just keep updating" a client demo without
-  needing a paid broker API. If you ever want true live tick data,
-  swap fetch_live_quotes() for a broker API call (Zerodha Kite
-  Connect, Upstox, etc.) - everything downstream (the socket push,
-  the frontend flash-on-change) stays the same.
-
-DEPLOYMENT NOTE (Render / gunicorn)
-  This app uses Flask-SocketIO for the live-price WebSocket push, which
-  needs an async-friendly worker. A few things matter for that to work
-  once you're behind gunicorn instead of `python app.py`:
-
-    1. `gevent.monkey.patch_all()` must run before anything else imports
-       (threading, requests, etc.) - it's the very first thing this
-       file does, below - so those libraries become green-thread aware
-       under gevent. (This app originally targeted eventlet, but
-       gunicorn 26+ dropped the eventlet worker entirely - eventlet
-       itself is now deprecated upstream too - so this uses gevent +
-       gevent-websocket instead, which gunicorn still ships proper
-       WebSocket support for.)
-    2. The background poller is started at *import time* (module level,
-       guarded by `_background_started`), not inside
-       `if __name__ == "__main__":` - gunicorn imports this module and
-       calls the `app`/`socketio` objects directly, it never executes
-       that `__main__` block, so anything that used to live only there
-       (like starting the poll thread) would silently never run.
-
-  Start command on Render:
-      gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app
-  (Use exactly 1 worker - Flask-SocketIO + gevent needs a message queue
-  like Redis to coordinate WebSocket state across more than one worker
-  process; -w 1 sidesteps that entirely for a demo-scale app.)
-
-  requirements.txt needs: flask, flask-socketio, gevent, gevent-websocket,
-  pandas, openpyxl, requests, gunicorn - see requirements.txt alongside
-  this file.
 
 BEFORE YOU RUN THIS LOCALLY
   pip install -r requirements.txt
@@ -98,27 +52,21 @@ BEFORE YOU RUN THIS LOCALLY
   Then:
   python app.py
   -> open http://127.0.0.1:5000 in a browser
-"""
 
-# gevent's monkey-patch MUST happen before anything else imports
-# threading/socket/requests etc, or Flask-SocketIO's gevent worker
-# ends up mixing real OS threads with green threads and you get
-# hangs/deadlocks that are miserable to debug. This has to be the
-# first executable line in the whole module.
-import gevent.monkey
-gevent.monkey.patch_all()
+DEPLOYMENT NOTE (Render / gunicorn)
+  This is now a plain synchronous Flask app - no WebSocket, no
+  background thread. Any standard gunicorn setup works, e.g.:
+      gunicorn -w 2 app:app
+  requirements.txt only needs: flask, pandas, openpyxl, gunicorn.
+"""
 
 import os
 import re
-import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import requests
 from flask import Flask, jsonify, render_template, request
-from flask_socketio import SocketIO
 
 # ======================= CONFIG - EDIT THESE =======================
 # By default everything is read from a "data" folder next to this file,
@@ -134,23 +82,9 @@ LOW_PRICE_FILE      = DATA_DIR / "Low_Price.xlsx"          # set to None to skip
 TREND_3DAY_FILE     = DATA_DIR / "uptrend_output.xlsx"     # set to None to skip
 TREND_5DAY_FILE     = DATA_DIR / "uptrend_5day.xlsx"       # set to None to skip
 TREND_ALL_FILE      = DATA_DIR / "trend_output.xlsx"       # ALL companies (Up/Down/Sideways) - set to None to skip
-
-# --- live CMP polling ---
-LIVE_CMP_ENABLED     = True   # set False to fall back to the old static Low_Price.xlsx CMP only
-POLL_INTERVAL_SECONDS = 300   # how often to refresh prices (Yahoo's NSE data itself only moves ~every 15 min, so
-                               # there's little point going below ~60s - lower this only if you want the "live"
-                               # feel more than the underlying number actually changing that often)
-YAHOO_CHUNK_SIZE      = 150   # symbols per Yahoo request - keep to two-ish hundred to avoid Yahoo rejecting the call
-WATCHED_SYMBOL_TTL_SECONDS = 900   # a searched company stays in the background poll for 15 min after being viewed
-ON_DEMAND_FETCH_TIMEOUT = 5    # seconds - keep short so an unresponsive Yahoo call never stalls a page load
 # ====================================================================
 
 app = Flask(__name__)
-# async_mode left unset so flask-socketio auto-picks the best available:
-# eventlet if it's installed (needed for gunicorn + WebSockets on Render -
-# see the __main__ block below), otherwise falls back to plain threading
-# for local `python app.py` runs.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 
 _GENERIC_WORDS = re.compile(r"\b(limited|ltd|company|co|corporation|corp|the|of|india)\b")
@@ -373,30 +307,13 @@ def resolve_query_to_entity(query: str):
 
 
 def get_price_quote(symbol):
+    """Static CMP/5-day-low/20-day-low lookup straight from
+    Low_Price.xlsx - no live/streaming price fetch."""
     if not symbol or LOW_PRICE_DF is None or symbol not in LOW_PRICE_DF.index:
         return None
     row = LOW_PRICE_DF.loc[symbol]
-
-    now = time.time()
-    with _LIVE_CMP_LOCK:
-        RECENTLY_VIEWED[symbol] = now  # keeps this symbol in the background poll for a while
-        live = LIVE_CMP.get(symbol)
-
-    if live is None:
-        # nobody's polled this one yet in this process - fetch it right
-        # now instead of making the page wait for the next background
-        # sweep. Short timeout, so a slow Yahoo response never stalls
-        # the page for more than ON_DEMAND_FETCH_TIMEOUT seconds.
-        live = fetch_live_quote_single(symbol)
-        if live is not None:
-            with _LIVE_CMP_LOCK:
-                LIVE_CMP[symbol] = live
-
     return {
-        # prefer the live price; fall back to the static Low_Price.xlsx
-        # snapshot if Yahoo has nothing for this symbol (just started,
-        # delisted, illiquid, or the on-demand fetch above failed/timed out)
-        "cmp": live if live is not None else row.get("LAST_PRICE"),
+        "cmp": row.get("LAST_PRICE"),
         "low_5day": row.get("5Day_Low"),
         "low_20day": row.get("20Day_Low"),
     }
@@ -415,116 +332,6 @@ def get_trend_badge(symbol):
     direction = {"U": "up", "D": "down"}.get(letter, "side")
     label = re.sub(r"^[A-Z]\s*", "", raw).strip()  # e.g. "▲ UpTrend"
     return {"direction": direction, "label": label}
-
-
-# --------------------------------- live CMP polling ---------------------------------
-
-LIVE_CMP = {}          # symbol -> latest price we've fetched from Yahoo
-RECENTLY_VIEWED = {}   # symbol -> epoch time it was last looked up (keeps it in the background poll for a while)
-_LIVE_CMP_LOCK = threading.Lock()
-
-YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
-_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NSECompanyTerminal/1.0)"}
-
-
-def build_symbol_universe():
-    """Only the symbols that actually need a *background-refreshed*
-    live price right now: the 3-day/5-day rising tables (shown to
-    every visitor, several rows at once, worth a periodic bulk
-    refresh), plus whichever companies someone has looked up in the
-    last WATCHED_SYMBOL_TTL_SECONDS (so a company someone has open
-    keeps updating live for a while, without needing every one of the
-    ~2700 NSE companies polled just in case someone looks at it).
-
-    This used to pull in the ENTIRE company universe (EQUITY_L.csv, or
-    later Low_Price.xlsx + trend_output.xlsx - both of which also cover
-    ~2700-2765 companies) every single cycle. That meant ~19 chunked
-    Yahoo requests every 5 minutes for companies nobody was even
-    looking at, which was competing for CPU/network with real visitor
-    requests on a free-tier host and is what made the site feel slow/
-    unresponsive. A specific company you search for now gets its price
-    fetched on demand instead (see get_price_quote()), so nothing has
-    to wait for a background sweep to reach it."""
-    symbols = set()
-    if TREND_3DAY:
-        symbols.update(row["symbol"] for row in TREND_3DAY if row.get("symbol"))
-    if TREND_5DAY:
-        symbols.update(row["symbol"] for row in TREND_5DAY if row.get("symbol"))
-    now = time.time()
-    with _LIVE_CMP_LOCK:
-        symbols.update(
-            sym for sym, last_seen in RECENTLY_VIEWED.items()
-            if now - last_seen < WATCHED_SYMBOL_TTL_SECONDS
-        )
-    return sorted(s for s in symbols if s)
-
-
-def fetch_live_quotes(symbols):
-    """Batch-fetch current prices for a list of NSE symbols from
-    Yahoo Finance's free quote endpoint (symbol.NS). Returns
-    {symbol: price} for whichever symbols Yahoo actually returned a
-    price for - missing/unknown symbols are just left out."""
-    quotes = {}
-    for i in range(0, len(symbols), YAHOO_CHUNK_SIZE):
-        chunk = symbols[i:i + YAHOO_CHUNK_SIZE]
-        yahoo_symbols = [s + ".NS" for s in chunk]
-        try:
-            resp = requests.get(
-                YAHOO_QUOTE_URL,
-                params={"symbols": ",".join(yahoo_symbols)},
-                headers=_YAHOO_HEADERS,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            for item in data.get("quoteResponse", {}).get("result", []):
-                sym = str(item.get("symbol", "")).replace(".NS", "")
-                price = item.get("regularMarketPrice")
-                if sym and price is not None:
-                    quotes[sym] = price
-        except Exception as e:
-            print(f"[warn] live CMP fetch failed for a batch of {len(chunk)} symbol(s): {e}")
-        time.sleep(0.3)  # be polite between batches
-    return quotes
-
-
-def fetch_live_quote_single(symbol, timeout=ON_DEMAND_FETCH_TIMEOUT):
-    """One-symbol version of fetch_live_quotes(), used for an on-demand
-    lookup when someone searches a company that isn't already in
-    LIVE_CMP from the background sweep. Kept to a short timeout so a
-    slow/unreachable Yahoo call can never stall a page load for long -
-    on any failure we just return None and the caller falls back to
-    the static Low_Price.xlsx value."""
-    try:
-        resp = requests.get(
-            YAHOO_QUOTE_URL,
-            params={"symbols": symbol + ".NS"},
-            headers=_YAHOO_HEADERS,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("quoteResponse", {}).get("result", [])
-        if results:
-            price = results[0].get("regularMarketPrice")
-            if price is not None:
-                return price
-    except Exception as e:
-        print(f"[warn] on-demand live CMP fetch failed for {symbol}: {e}")
-    return None
-
-
-def poll_live_cmp_forever():
-    while True:
-        universe = build_symbol_universe()
-        if universe:
-            new_quotes = fetch_live_quotes(universe)
-            if new_quotes:
-                with _LIVE_CMP_LOCK:
-                    LIVE_CMP.update(new_quotes)
-                socketio.emit("price_update", {"prices": new_quotes})
-                print(f"[live-cmp] pushed {len(new_quotes)} updated price(s) for {len(universe)} watched symbol(s)")
-        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 # --------------------------------- routes ---------------------------------
@@ -635,25 +442,11 @@ def api_latest_news():
     return jsonify(records)
 
 
-# --------------------------- start the background poller ---------------------------
-# This runs at *import time*, not inside `if __name__ == "__main__":`, so it
-# fires whether the app is launched with `python app.py` (dev) or with
-# `gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app`
-# (Render/production) - gunicorn imports this module and never executes the
-# __main__ block below, so anything the live-price feature needs has to be
-# started here instead.
-_background_started = False
-if LIVE_CMP_ENABLED and not _background_started:
-    socketio.start_background_task(poll_live_cmp_forever)
-    _background_started = True
-
-
 if __name__ == "__main__":
     # Render (and most hosts) set PORT for you and expect the app to
     # bind 0.0.0.0. debug=True is a security risk on a public server
     # (it exposes a live Python console on error pages), so it's off
     # whenever PORT is set - i.e. whenever this is actually deployed.
-    # socketio.run replaces app.run so the WebSocket server starts too.
     port = int(os.environ.get("PORT", 5000))
     is_hosted = "PORT" in os.environ
-    socketio.run(app, host="0.0.0.0", port=port, debug=not is_hosted, allow_unsafe_werkzeug=True)
+    app.run(host="0.0.0.0", port=port, debug=not is_hosted)
