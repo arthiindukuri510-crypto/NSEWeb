@@ -421,13 +421,14 @@ def api_trend_5day():
 @app.route("/api/latest-news")
 def api_latest_news():
     """Every article published on the most recent date present in
-    NEWS_FILE - not a fixed top-N count. If you add a new day's news
-    and restart the app, this automatically follows the new latest
-    date; it never stays stuck showing an older day's items."""
+    NEWS_FILE, plus the date immediately before it - not a fixed
+    top-N count. If you add a new day's news and restart the app,
+    this automatically follows the new latest two dates; it never
+    stays stuck showing older days' items."""
     if NEWS_DF.empty:
         return jsonify([])
-    latest_date = NEWS_DF["date_str"].max()
-    rows = NEWS_DF[NEWS_DF["date_str"] == latest_date].sort_values("date_str", ascending=False)
+    latest_two_dates = sorted(NEWS_DF["date_str"].unique(), reverse=True)[:2]
+    rows = NEWS_DF[NEWS_DF["date_str"].isin(latest_two_dates)].sort_values("date_str", ascending=False)
     records = [
         {
             "company": row["display_name"],
