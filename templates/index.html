@@ -237,6 +237,24 @@
   .try-chip{ font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:var(--text); background:var(--panel); border:1px solid var(--line); padding:6px 12px; border-radius:8px; cursor:pointer; }
   .try-chip:hover{ border-color:var(--brand); color:var(--brand); }
 
+  /* ---- logged-in bar + role rules ---- */
+  .user-bar{
+    max-width:1180px; margin:0 auto; padding:10px 24px 0; display:flex; justify-content:flex-end;
+    align-items:center; gap:12px; font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted);
+  }
+  .logout-btn{
+    cursor:pointer; border:1px solid var(--line); border-radius:8px; padding:5px 12px;
+    color:var(--text); background:var(--panel); user-select:none; transition:all .12s ease;
+  }
+  .logout-btn:hover{ border-color:var(--neg); color:var(--neg); }
+
+  /* USER accounts see only the 3-Day / 5-Day Rising tables */
+  .role-user .search-wrap, .role-user #main, .role-user #pageHeader, .role-user .tape,
+  .role-user [data-panel="latestNews"], .role-user [data-panel="posNews"],
+  .role-user #latestNewsPanel, .role-user #posNewsPanel{ display:none !important; }
+  .role-user .dash-wrap{ padding-top:14px; }
+  .role-user .trend-table tbody tr{ cursor:default; }
+
   footer{ text-align:center; color:#4a525c; font-size:12px; padding:20px; font-family:'IBM Plex Mono',monospace; }
 
   @media (max-width:520px){
@@ -245,9 +263,14 @@
   }
 </style>
 </head>
-<body>
+<body class="role-{{ role }}">
 
   <div class="tape"><div class="tape-track" id="tapeTrack"></div></div>
+
+  <div class="user-bar">
+    <span>{{ name }} · {{ role }}</span>
+    <span class="logout-btn" id="logoutBtn">Logout</span>
+  </div>
 
   <div class="search-wrap">
     <div class="search-box">
@@ -317,16 +340,34 @@
   const clearBtn = document.getElementById('clearBtn');
   let companyList = [];
 
-  fetch('/api/stats').then(r=>r.json()).then(stats=>{
-    document.getElementById('footerLine').textContent =
-      stats.companies.toLocaleString() + ' companies · ' + stats.articles.toLocaleString() + ' articles';
+  // set by the server from the login session: "admin" or "user"
+  const ROLE = {{ role|tojson }};
+
+  // if the login expires, any API call answers 401 -> go back to the login page
+  const _fetch = window.fetch;
+  window.fetch = async function(...args){
+    const r = await _fetch(...args);
+    if(r.status === 401) window.location.href = '/login';
+    return r;
+  };
+
+  document.getElementById('logoutBtn').addEventListener('click', ()=>{
+    fetch('/logout', {method:'POST'}).finally(()=>{ window.location.href = '/login'; });
   });
 
-  fetch('/api/companies').then(r=>r.json()).then(list=>{
-    companyList = list;
-    buildTape(list);
-    buildTryChips(list);
-  });
+  // admin only: footer stats + company list (search box, ticker tape)
+  if(ROLE === 'admin'){
+    fetch('/api/stats').then(r=>r.json()).then(stats=>{
+      document.getElementById('footerLine').textContent =
+        stats.companies.toLocaleString() + ' companies · ' + stats.articles.toLocaleString() + ' articles';
+    });
+
+    fetch('/api/companies').then(r=>r.json()).then(list=>{
+      companyList = list;
+      buildTape(list);
+      buildTryChips(list);
+    });
+  }
 
   function showIntro(){
     main.innerHTML =
@@ -356,12 +397,17 @@
     document.querySelectorAll('.dash-panel').forEach(p=> p.classList.toggle('active', p.id === target+'Panel'));
   });
 
+  // everyone (user + admin)
   fetch('/api/trend/3day').then(r=>r.json()).then(d=> renderTrendPanel('trend3', d));
   fetch('/api/trend/5day').then(r=>r.json()).then(d=> renderTrendPanel('trend5', d));
-  fetch('/api/latest-news').then(r=>r.json()).then(renderLatestNews);
 
-  // ---- Positive News tab: last 5 days, with a "show all" button at the end ----
-  fetch('/api/positive-news').then(r=>r.json()).then(list=> renderPositiveNews(list, false));
+  // admin only
+  if(ROLE === 'admin'){
+    fetch('/api/latest-news').then(r=>r.json()).then(renderLatestNews);
+
+    // ---- Positive News tab: last 5 days, with a "show all" button at the end ----
+    fetch('/api/positive-news').then(r=>r.json()).then(list=> renderPositiveNews(list, false));
+  }
 
   function loadAllPositiveNews(){
     document.getElementById('posNewsBody').innerHTML = '<div class="dash-empty">Loading…</div>';
@@ -434,7 +480,7 @@
       '<table class="trend-table"><thead><tr>' +
         '<th>#</th><th>Symbol</th><th>Trend</th><th class="num">Support High</th><th class="num">Support Low</th><th class="num">CMP</th><th class="num">Last Price</th>' +
       '</tr></thead><tbody>'+rowsHtml+'</tbody></table>';
-    body.querySelectorAll('tbody tr').forEach(el=>{
+    if(ROLE === 'admin') body.querySelectorAll('tbody tr').forEach(el=>{
       el.addEventListener('click', ()=>{
         selectCompany(el.dataset.key);
         document.getElementById('main').scrollIntoView({behavior:'smooth', block:'start'});
