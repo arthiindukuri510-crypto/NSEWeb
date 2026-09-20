@@ -109,10 +109,22 @@ app = Flask(__name__)
 #   APPS_SCRIPT_SECRET  same text as API_SECRET in the Apps Script
 #
 # ADMIN -> everything.   USER -> only the 3-Day / 5-Day Rising tables.
-SECRET_KEY         = os.environ.get("SECRET_KEY")
-ADMIN_PASSWORD     = os.environ.get("ADMIN_PASSWORD")
-APPS_SCRIPT_URL    = os.environ.get("APPS_SCRIPT_URL")
-APPS_SCRIPT_SECRET = os.environ.get("APPS_SCRIPT_SECRET")
+def _env(name):
+    """Environment value with stray spaces/newlines removed ('' if not set)."""
+    return (os.environ.get(name) or "").strip()
+
+
+SECRET_KEY         = _env("SECRET_KEY")
+ADMIN_PASSWORD     = _env("ADMIN_PASSWORD")
+APPS_SCRIPT_URL    = _env("APPS_SCRIPT_URL")
+APPS_SCRIPT_SECRET = _env("APPS_SCRIPT_SECRET")
+
+# one line in the Render Logs showing which settings are present (values are never printed)
+print("[login config] " + ", ".join(
+    f"{n}={'set' if v else 'MISSING'}" for n, v in [
+        ("SECRET_KEY", SECRET_KEY), ("ADMIN_PASSWORD", ADMIN_PASSWORD),
+        ("APPS_SCRIPT_URL", APPS_SCRIPT_URL), ("APPS_SCRIPT_SECRET", APPS_SCRIPT_SECRET),
+    ]))
 
 IS_HOSTED = "PORT" in os.environ
 if not SECRET_KEY:
@@ -185,6 +197,8 @@ def _no_store(resp):
 def call_sheet(payload):
     """Talk to the Google Apps Script that keeps the Users sheet."""
     if not APPS_SCRIPT_URL or not APPS_SCRIPT_SECRET:
+        missing = [n for n, v in [("APPS_SCRIPT_URL", APPS_SCRIPT_URL), ("APPS_SCRIPT_SECRET", APPS_SCRIPT_SECRET)] if not v]
+        print(f"[warn] user login not set up - missing in Render Environment: {', '.join(missing)}")
         return {"ok": False, "code": "server", "error": "User login is not set up on the server yet."}
     try:
         r = requests.post(APPS_SCRIPT_URL, json={**payload, "secret": APPS_SCRIPT_SECRET}, timeout=25)
