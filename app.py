@@ -110,14 +110,26 @@ app = Flask(__name__)
 #
 # ADMIN -> everything.   USER -> only the 3-Day / 5-Day Rising tables.
 def _env(name):
-    """Environment value with stray spaces/newlines removed ('' if not set)."""
-    return (os.environ.get(name) or "").strip()
+    """Environment value with stray spaces/newlines removed ('' if not set).
+    Also finds the setting when its NAME has a hidden space or different
+    capitals (e.g. 'APPS_SCRIPT_SECRET ' typed with a trailing space)."""
+    val = os.environ.get(name)
+    if val is None:
+        for k, v in os.environ.items():
+            if k.strip().replace(" ", "").upper() == name:
+                val = v
+                break
+    return (val or "").strip()
 
 
 SECRET_KEY         = _env("SECRET_KEY")
 ADMIN_PASSWORD     = _env("ADMIN_PASSWORD")
 APPS_SCRIPT_URL    = _env("APPS_SCRIPT_URL")
 APPS_SCRIPT_SECRET = _env("APPS_SCRIPT_SECRET")
+
+# names (never values) of any setting that looks related, so a typo in a NAME shows up in the Logs
+print("[env names] " + ", ".join(sorted(
+    repr(k) for k in os.environ if any(w in k.upper() for w in ("APPS", "SCRIPT", "SECRET", "ADMIN")))))
 
 # one line in the Render Logs showing which settings are present (values are never printed)
 print("[login config] " + ", ".join(
