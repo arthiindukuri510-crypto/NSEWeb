@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login · NSE Company Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Space+Grotesk:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0d10; --panel:#12161b; --panel-2:#171c22; --line:#242b33;
+    --text:#e7eaee; --muted:#8a94a1; --accent:#3ddc97; --neg:#ff5d5d; --brand:#5aa9ff;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(90,169,255,0.10), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(61,220,151,0.08), transparent 55%),
+      var(--bg);
+    color:var(--text); font-family:'Inter',system-ui,sans-serif; min-height:100vh;
+    display:flex; align-items:center; justify-content:center; padding:24px;
+  }
+  .card{
+    width:100%; max-width:420px; background:var(--panel); border:1px solid var(--line);
+    border-radius:18px; padding:28px 26px 26px; box-shadow:0 24px 60px rgba(0,0,0,0.45);
+  }
+  .eyebrow{ font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:0.2em; text-transform:uppercase; color:var(--brand); text-align:center; }
+  h1{ font-family:'Archivo',sans-serif; font-weight:700; font-size:22px; margin:6px 0 20px; text-align:center; }
+  h1 .hl{ color:var(--accent); }
+
+  .tabs{ display:flex; gap:6px; background:var(--panel-2); border:1px solid var(--line); border-radius:11px; padding:4px; margin-bottom:20px; }
+  .tabs button{
+    flex:1; background:none; border:none; color:var(--muted); font-family:'Space Grotesk',sans-serif;
+    font-weight:700; font-size:13px; padding:9px 6px; border-radius:8px; cursor:pointer; transition:all .12s ease;
+  }
+  .tabs button:hover{ color:var(--text); }
+  .tabs button.active{ background:rgba(61,220,151,0.12); color:var(--accent); }
+
+  form{ display:none; }
+  form.active{ display:block; }
+  label{ display:block; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.05em; text-transform:uppercase; color:var(--muted); margin:14px 0 6px; }
+  input{
+    width:100%; background:#0f1420; border:1px solid var(--line); border-radius:10px; color:var(--text);
+    font-size:15px; font-family:'Inter',sans-serif; padding:12px 14px; outline:none;
+    transition:border-color .15s ease, box-shadow .15s ease;
+  }
+  input:focus{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(61,220,151,0.14); }
+  input::placeholder{ color:#5b6572; }
+
+  .submit{
+    width:100%; margin-top:20px; background:rgba(61,220,151,0.12); color:var(--accent);
+    border:1px solid var(--accent); border-radius:10px; padding:12px; font-family:'Space Grotesk',sans-serif;
+    font-weight:700; font-size:14.5px; cursor:pointer; transition:all .12s ease;
+  }
+  .submit:hover{ background:rgba(61,220,151,0.22); }
+  .submit:disabled{ opacity:.55; cursor:default; }
+
+  .msg{ min-height:20px; margin-top:16px; font-size:13.5px; line-height:1.45; text-align:center; }
+  .msg.err{ color:var(--neg); }
+  .msg.ok{ color:var(--accent); }
+  .hint{ color:var(--muted); font-size:12.5px; margin-top:12px; text-align:center; line-height:1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="eyebrow">Company Terminal</div>
+    <h1>NSE <span class="hl">Company Terminal</span></h1>
+
+    <div class="tabs" id="tabs">
+      <button type="button" data-tab="login" class="active">User Login</button>
+      <button type="button" data-tab="register">Register</button>
+      <button type="button" data-tab="admin">Admin</button>
+    </div>
+
+    <form id="login" class="active" autocomplete="on">
+      <label for="l_id">Name or phone number</label>
+      <input id="l_id" name="username" type="text" autocomplete="username" placeholder="Your name or 10-digit phone" required>
+      <label for="l_pw">Password</label>
+      <input id="l_pw" name="password" type="password" autocomplete="current-password" placeholder="Password" required>
+      <button class="submit" type="submit">Log in</button>
+    </form>
+
+    <form id="register" autocomplete="on">
+      <label for="r_name">Name</label>
+      <input id="r_name" type="text" autocomplete="name" placeholder="Your full name" required>
+      <label for="r_phone">Phone number</label>
+      <input id="r_phone" type="tel" autocomplete="tel" placeholder="10-digit phone number" required>
+      <label for="r_pw">Password</label>
+      <input id="r_pw" type="password" autocomplete="new-password" placeholder="At least 6 characters" required>
+      <label for="r_pw2">Confirm password</label>
+      <input id="r_pw2" type="password" autocomplete="new-password" placeholder="Type the password again" required>
+      <button class="submit" type="submit">Create account</button>
+      <div class="hint">Your name must be unique - you can log in with your name or your phone number.</div>
+    </form>
+
+    <form id="admin" autocomplete="off">
+      <label for="a_pw">Admin password</label>
+      <input id="a_pw" type="password" autocomplete="current-password" placeholder="Admin password" required>
+      <button class="submit" type="submit">Admin log in</button>
+    </form>
+
+    <div class="msg" id="msg"></div>
+  </div>
+
+<script>
+(function(){
+  const msg = document.getElementById('msg');
+
+  function say(text, kind){
+    msg.textContent = text || '';
+    msg.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+
+  function showTab(name){
+    document.querySelectorAll('#tabs button').forEach(b=> b.classList.toggle('active', b.dataset.tab === name));
+    document.querySelectorAll('form').forEach(f=> f.classList.toggle('active', f.id === name));
+    say('');
+  }
+  document.getElementById('tabs').addEventListener('click', e=>{
+    const b = e.target.closest('button');
+    if(b) showTab(b.dataset.tab);
+  });
+
+  async function post(url, data){
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    let j = {};
+    try { j = await r.json(); } catch(e) {}
+    return {status: r.status, data: j};
+  }
+
+  async function submit(form, url, data, onOk){
+    const btn = form.querySelector('.submit');
+    btn.disabled = true;
+    say('Please wait…');
+    try{
+      const res = await post(url, data);
+      if(res.data && res.data.ok){ onOk(res.data); }
+      else { say((res.data && res.data.error) || 'Something went wrong. Please try again.', 'err'); }
+    } catch(e){
+      say('Network problem. Please try again.', 'err');
+    }
+    btn.disabled = false;
+  }
+
+  document.getElementById('login').addEventListener('submit', e=>{
+    e.preventDefault();
+    submit(e.target, '/api/login', {
+      mode: 'user',
+      identifier: document.getElementById('l_id').value,
+      password: document.getElementById('l_pw').value
+    }, ()=>{ window.location.href = '/'; });
+  });
+
+  document.getElementById('admin').addEventListener('submit', e=>{
+    e.preventDefault();
+    submit(e.target, '/api/login', {
+      mode: 'admin',
+      password: document.getElementById('a_pw').value
+    }, ()=>{ window.location.href = '/'; });
+  });
+
+  document.getElementById('register').addEventListener('submit', e=>{
+    e.preventDefault();
+    const pw = document.getElementById('r_pw').value;
+    const pw2 = document.getElementById('r_pw2').value;
+    const phone = document.getElementById('r_phone').value;
+    if(pw !== pw2){ say('Passwords do not match.', 'err'); return; }
+    if(pw.length < 6){ say('Password must be at least 6 characters.', 'err'); return; }
+    if(phone.replace(/\D/g,'').length < 10){ say('Enter a valid 10-digit phone number.', 'err'); return; }
+    submit(e.target, '/api/register', {
+      name: document.getElementById('r_name').value,
+      phone: phone,
+      password: pw,
+      confirm: pw2
+    }, (d)=>{
+      e.target.reset();
+      showTab('login');
+      document.getElementById('l_id').value = d.phone || '';
+      document.getElementById('l_pw').focus();
+      say('Account created. Please log in.', 'ok');
+    });
+  });
+})();
+</script>
+</body>
+</html>
