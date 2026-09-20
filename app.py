@@ -57,16 +57,27 @@ DEPLOYMENT NOTE (Render / gunicorn)
   This is now a plain synchronous Flask app - no WebSocket, no
   background thread. Any standard gunicorn setup works, e.g.:
       gunicorn -w 2 app:app
-  requirements.txt only needs: flask, pandas, openpyxl, gunicorn.
+  requirements.txt only needs: flask, pandas, openpyxl, gunicorn, requests.
+
+LOGIN
+  Admin (password only) sees everything; registered users see only the
+  3-Day / 5-Day Rising tables. User accounts live in a Google Sheet behind
+  an Apps Script (see UserAuth_AppsScript.gs). Set SECRET_KEY,
+  ADMIN_PASSWORD, APPS_SCRIPT_URL and APPS_SCRIPT_SECRET in Render.
 """
 
+import hmac
 import os
 import re
+import time
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+import requests
+from flask import Flask, jsonify, redirect, render_template, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ======================= CONFIG - EDIT THESE =======================
 # By default everything is read from a "data" folder next to this file,
@@ -89,6 +100,108 @@ POSITIVE_DAYS       = 5
 # ====================================================================
 
 app = Flask(__name__)
+
+# ============================ LOGIN / ROLES ============================
+# Set these in Render -> your service -> Environment (never hard-code them):
+#   SECRET_KEY          long random text - signs the login cookie
+#   ADMIN_PASSWORD      the admin's password
+#   APPS_SCRIPT_URL     the Google Apps Script web-app URL (ends in /exec)
+#   APPS_SCRIPT_SECRET  same text as API_SECRET in the Apps Script
+#
+# ADMIN -> everything.   USER -> only the 3-Day / 5-Day Rising tables.
+SECRET_KEY         = os.environ.get("SECRET_KEY")
+ADMIN_PASSWORD     = os.environ.get("ADMIN_PASSWORD")
+APPS_SCRIPT_URL    = os.environ.get("APPS_SCRIPT_URL")
+APPS_SCRIPT_SECRET = os.environ.get("APPS_SCRIPT_SECRET")
+
+IS_HOSTED = "PORT" in os.environ
+if not SECRET_KEY:
+    if IS_HOSTED:
+        raise RuntimeError("SECRET_KEY is not set - add it in Render -> Environment.")
+    SECRET_KEY = "dev-only-secret-change-me"      # local testing only
+
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=IS_HOSTED,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
+
+# used so a wrong name and a wrong password take the same time to reject
+_DUMMY_HASH = generate_password_hash("not-a-real-password")
+
+# simple brute-force guard: too many wrong attempts -> wait 10 minutes
+_FAILS = {}
+MAX_FAILS, FAIL_WINDOW = 6, 600
+
+
+def _too_many(key):
+    now = time.time()
+    hits = [t for t in _FAILS.get(key, []) if now - t < FAIL_WINDOW]
+    _FAILS[key] = hits
+    return len(hits) >= MAX_FAILS
+
+
+def _record_fail(key):
+    _FAILS.setdefault(key, []).append(time.time())
+
+
+def _clear_fails(key):
+    _FAILS.pop(key, None)
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if session.get("role") not in ("admin", "user"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "login required"}), 401
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        role = session.get("role")
+        if role == "admin":
+            return f(*args, **kwargs)
+        if role == "user":
+            return jsonify({"error": "admin only"}), 403
+        return jsonify({"error": "login required"}), 401
+    return wrapper
+
+
+@app.after_request
+def _no_store(resp):
+    # never let the browser cache pages/data behind the login
+    if request.path in ("/", "/login") or request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def call_sheet(payload):
+    """Talk to the Google Apps Script that keeps the Users sheet."""
+    if not APPS_SCRIPT_URL or not APPS_SCRIPT_SECRET:
+        return {"ok": False, "code": "server", "error": "User login is not set up on the server yet."}
+    try:
+        r = requests.post(APPS_SCRIPT_URL, json={**payload, "secret": APPS_SCRIPT_SECRET}, timeout=25)
+        return r.json()
+    except Exception as e:
+        print(f"[warn] Apps Script call failed: {e}")
+        return {"ok": False, "code": "server", "error": "Could not reach the user database. Please try again."}
+
+
+def clean_phone(raw):
+    """Any of 9876543210 / +91 98765 43210 / 09876543210 -> '9876543210', else None."""
+    d = re.sub(r"\D", "", str(raw))
+    if len(d) == 12 and d.startswith("91"):
+        d = d[2:]
+    elif len(d) == 11 and d.startswith("0"):
+        d = d[1:]
+    return d if re.fullmatch(r"\d{10}", d) else None
 
 
 _GENERIC_WORDS = re.compile(r"\b(limited|ltd|company|co|corporation|corp|the|of|india)\b")
@@ -341,12 +454,109 @@ def get_trend_badge(symbol):
 # --------------------------------- routes ---------------------------------
 
 
+@app.route("/login")
+def login_page():
+    if session.get("role") in ("admin", "user"):
+        return redirect("/")
+    return render_template("login.html")
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    d = request.get_json(silent=True) or {}
+    name = re.sub(r"\s+", " ", str(d.get("name", "")).strip())
+    phone = clean_phone(d.get("phone", ""))
+    pw = str(d.get("password", ""))
+    confirm = str(d.get("confirm", ""))
+
+    if not (2 <= len(name) <= 40) or not re.search(r"[^\W\d_]", name):
+        return jsonify({"ok": False, "error": "Enter your name (2-40 characters, with letters)."}), 400
+    if not phone:
+        return jsonify({"ok": False, "error": "Enter a valid 10-digit phone number."}), 400
+    if not (6 <= len(pw) <= 64):
+        return jsonify({"ok": False, "error": "Password must be 6 to 64 characters."}), 400
+    if pw != confirm:
+        return jsonify({"ok": False, "error": "Passwords do not match."}), 400
+
+    # only a salted hash ever leaves this server - never the password itself
+    res = call_sheet({"action": "add", "name": name, "phone": phone, "hash": generate_password_hash(pw)})
+    if res.get("ok"):
+        return jsonify({"ok": True, "phone": phone})
+    code = res.get("code")
+    if code == "phone_exists":
+        return jsonify({"ok": False, "error": "This phone number is already registered. Please log in."}), 409
+    if code == "name_exists":
+        return jsonify({"ok": False, "error": "This name is already taken. Please use a different name."}), 409
+    return jsonify({"ok": False, "error": res.get("error", "Registration failed.")}), 503
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    d = request.get_json(silent=True) or {}
+    mode = d.get("mode")
+    pw = str(d.get("password", ""))
+
+    # ---- admin: password only ----
+    if mode == "admin":
+        key = "admin"
+        if _too_many(key):
+            return jsonify({"ok": False, "error": "Too many wrong attempts. Try again in 10 minutes."}), 429
+        if ADMIN_PASSWORD and hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode()):
+            _clear_fails(key)
+            session.clear()
+            session["role"], session["name"] = "admin", "Admin"
+            session.permanent = True
+            return jsonify({"ok": True})
+        _record_fail(key)
+        return jsonify({"ok": False, "error": "Wrong admin password."}), 401
+
+    # ---- user: name OR phone + password ----
+    ident = re.sub(r"\s+", " ", str(d.get("identifier", "")).strip())
+    if not ident or not pw:
+        return jsonify({"ok": False, "error": "Enter your name or phone number and password."}), 400
+
+    looks_like_phone = bool(re.fullmatch(r"[\d\s+\-]+", ident))
+    phone = clean_phone(ident) if looks_like_phone else None
+    if looks_like_phone and not phone:
+        return jsonify({"ok": False, "error": "Enter a valid 10-digit phone number, or your name."}), 400
+
+    key = "user|" + (phone or ident.lower())
+    if _too_many(key):
+        return jsonify({"ok": False, "error": "Too many wrong attempts. Try again in 10 minutes."}), 429
+
+    res = call_sheet({"action": "find", "kind": "phone" if phone else "name", "identifier": phone or ident})
+    if not res.get("ok"):
+        return jsonify({"ok": False, "error": res.get("error", "Login is unavailable right now.")}), 503
+
+    user = res.get("user")
+    good = check_password_hash(user["hash"] if user else _DUMMY_HASH, pw)
+    if not user or not good:
+        _record_fail(key)
+        return jsonify({"ok": False, "error": "Wrong name/phone or password."}), 401
+    if str(user.get("status", "")).strip().lower() != "active":
+        return jsonify({"ok": False, "error": "Your account is not active. Please contact the admin."}), 403
+
+    _clear_fails(key)
+    session.clear()
+    session["role"], session["name"] = "user", user.get("name", "User")
+    session.permanent = True
+    return jsonify({"ok": True})
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
 @app.route("/")
+@login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", role=session["role"], name=session.get("name", ""))
 
 
 @app.route("/api/companies")
+@admin_required
 def api_companies():
     """Company/symbol matches for the search box. Matches against both
     the display name and the NSE symbol."""
@@ -369,6 +579,7 @@ def api_companies():
 
 
 @app.route("/api/news/<path:query>")
+@admin_required
 def api_news(query):
     key = resolve_query_to_entity(query)
     if key is None:
@@ -401,6 +612,7 @@ def api_news(query):
 
 
 @app.route("/api/stats")
+@admin_required
 def api_stats():
     return jsonify({
         "companies": len(ENTITIES),
@@ -409,6 +621,7 @@ def api_stats():
 
 
 @app.route("/api/trend/3day")
+@login_required
 def api_trend_3day():
     if TREND_3DAY is None:
         return jsonify({"rows": [], "available": False})
@@ -416,6 +629,7 @@ def api_trend_3day():
 
 
 @app.route("/api/trend/5day")
+@login_required
 def api_trend_5day():
     if TREND_5DAY is None:
         return jsonify({"rows": [], "available": False})
@@ -423,6 +637,7 @@ def api_trend_5day():
 
 
 @app.route("/api/latest-news")
+@admin_required
 def api_latest_news():
     """Every article published on the most recent date present in
     NEWS_FILE, plus the date immediately before it - not a fixed
@@ -448,6 +663,7 @@ def api_latest_news():
 
 
 @app.route("/api/positive-news")
+@admin_required
 def api_positive_news():
     """Positive-sentiment news from Company_News.xlsx only.
     Default: the latest POSITIVE_DAYS calendar days (counted back from
@@ -482,5 +698,4 @@ if __name__ == "__main__":
     # (it exposes a live Python console on error pages), so it's off
     # whenever PORT is set - i.e. whenever this is actually deployed.
     port = int(os.environ.get("PORT", 5000))
-    is_hosted = "PORT" in os.environ
-    app.run(host="0.0.0.0", port=port, debug=not is_hosted)
+    app.run(host="0.0.0.0", port=port, debug=not IS_HOSTED)
