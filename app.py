@@ -82,6 +82,10 @@ LOW_PRICE_FILE      = DATA_DIR / "Low_Price.xlsx"          # set to None to skip
 TREND_3DAY_FILE     = DATA_DIR / "uptrend_output.xlsx"     # set to None to skip
 TREND_5DAY_FILE     = DATA_DIR / "uptrend_5day.xlsx"       # set to None to skip
 TREND_ALL_FILE      = DATA_DIR / "trend_output.xlsx"       # ALL companies (Up/Down/Sideways) - set to None to skip
+
+# "Positive News" tab: how many calendar days (counted back from the
+# newest date in NEWS_FILE) the default view covers
+POSITIVE_DAYS       = 5
 # ====================================================================
 
 app = Flask(__name__)
@@ -441,6 +445,35 @@ def api_latest_news():
         for _, row in rows.iterrows()
     ]
     return jsonify(records)
+
+
+@app.route("/api/positive-news")
+def api_positive_news():
+    """Positive-sentiment news from Company_News.xlsx only.
+    Default: the latest POSITIVE_DAYS calendar days (counted back from
+    the newest date in the file). With ?all=1: every positive item."""
+    if NEWS_DF.empty:
+        return jsonify([])
+
+    pos = NEWS_DF[NEWS_DF["Sentiment"] == "positive"]
+
+    if request.args.get("all") != "1":
+        latest = pd.to_datetime(NEWS_DF["date_str"]).max()
+        cutoff = (latest - timedelta(days=POSITIVE_DAYS - 1)).strftime("%Y-%m-%d")
+        pos = pos[pos["date_str"] >= cutoff]
+
+    pos = pos.sort_values("date_str", ascending=False)
+    return jsonify([
+        {
+            "company": row["display_name"],
+            "symbol": None if pd.isna(row["symbol"]) else row["symbol"],
+            "date": row["date_str"],
+            "summary": row["Summary"],
+            "sentiment": row["Sentiment"],
+            "category": None if pd.isna(row["category"]) else row["category"],
+        }
+        for _, row in pos.iterrows()
+    ])
 
 
 if __name__ == "__main__":
