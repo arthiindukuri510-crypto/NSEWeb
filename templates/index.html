@@ -95,7 +95,7 @@
   }
   .back-btn:hover{ color:var(--text); border-color:var(--brand); }
 
-  /* ---- dashboard: 3-day / 5-day rising + latest news, tabbed ---- */
+  /* ---- dashboard: 3-day / 5-day rising + latest news + positive news, tabbed ---- */
   .dash-wrap{ max-width:1180px; margin:0 auto; padding:0 24px 8px; }
 
   .dash-tabs{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
@@ -160,6 +160,15 @@
   .news-row-date{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--muted); flex-shrink:0; }
   .news-row-tags{ display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
   .news-row-summary{ font-size:12.5px; color:#cdd3da; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+  /* ---- "Show all positive news" button at the end of the Positive News tab ---- */
+  .show-all-wrap{ padding:14px 16px; text-align:center; border-top:1px solid var(--line); }
+  .show-all-btn{
+    display:inline-block; font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:13px;
+    color:var(--accent); background:rgba(61,220,151,0.10); border:1px solid var(--accent);
+    border-radius:10px; padding:9px 18px; cursor:pointer; user-select:none; transition:all .12s ease;
+  }
+  .show-all-btn:hover{ background:rgba(61,220,151,0.20); }
 
   /* ---- quote card ---- */
   .quote-card{
@@ -276,6 +285,9 @@
       <div class="dash-tab" data-panel="latestNews">
         📰 Latest News <span class="dash-tab-count" id="latestNewsCount"></span>
       </div>
+      <div class="dash-tab" data-panel="posNews">
+        ✅ Positive News (5 Days) <span class="dash-tab-count" id="posNewsCount"></span>
+      </div>
     </div>
 
     <div class="dash-panel active" id="trend3Panel">
@@ -286,6 +298,9 @@
     </div>
     <div class="dash-panel" id="latestNewsPanel">
       <div class="dash-panel-body" id="latestNewsBody"><div class="dash-empty">Loading…</div></div>
+    </div>
+    <div class="dash-panel" id="posNewsPanel">
+      <div class="dash-panel-body" id="posNewsBody"><div class="dash-empty">Loading…</div></div>
     </div>
   </div>
 
@@ -332,7 +347,7 @@
   }
   clearBtn.addEventListener('click', closeSearch);
 
-  // ---- dashboard tabs: 3-day / 5-day rising + latest news ----
+  // ---- dashboard tabs: 3-day / 5-day rising + latest news + positive news ----
   document.getElementById('dashTabs').addEventListener('click', (e)=>{
     const tab = e.target.closest('.dash-tab');
     if(!tab) return;
@@ -344,6 +359,54 @@
   fetch('/api/trend/3day').then(r=>r.json()).then(d=> renderTrendPanel('trend3', d));
   fetch('/api/trend/5day').then(r=>r.json()).then(d=> renderTrendPanel('trend5', d));
   fetch('/api/latest-news').then(r=>r.json()).then(renderLatestNews);
+
+  // ---- Positive News tab: last 5 days, with a "show all" button at the end ----
+  fetch('/api/positive-news').then(r=>r.json()).then(list=> renderPositiveNews(list, false));
+
+  function loadAllPositiveNews(){
+    document.getElementById('posNewsBody').innerHTML = '<div class="dash-empty">Loading…</div>';
+    fetch('/api/positive-news?all=1').then(r=>r.json()).then(list=> renderPositiveNews(list, true));
+  }
+
+  function renderPositiveNews(list, showingAll){
+    const body = document.getElementById('posNewsBody');
+    const countEl = document.getElementById('posNewsCount');
+    if(!list.length){
+      body.innerHTML = '<div class="dash-empty">No positive news found.</div>';
+      countEl.textContent = '';
+      return;
+    }
+    countEl.textContent = list.length + ' items';
+    const rows = list.map(n=>{
+      const cat = n.category;
+      return '<div class="news-row" data-key="'+escapeAttr(n.symbol || n.company)+'">' +
+        '<div class="news-row-top">' +
+          '<span class="news-row-company">'+escapeHtml(n.symbol || n.company)+'</span>' +
+          '<span class="news-row-date">'+formatDate(n.date)+'</span>' +
+        '</div>' +
+        '<div class="news-row-tags">' +
+          (cat ? '<span class="tag category '+cat+'">'+cat.replace(/_/g,' ')+'</span>' : '') +
+          '<span class="tag sentiment positive">positive</span>' +
+        '</div>' +
+        '<div class="news-row-summary">'+escapeHtml(n.summary)+'</div>' +
+      '</div>';
+    }).join('');
+
+    const footer = showingAll
+      ? ''
+      : '<div class="show-all-wrap"><span class="show-all-btn" id="showAllPosBtn">Show all positive news</span></div>';
+
+    body.innerHTML = rows + footer;
+
+    body.querySelectorAll('.news-row').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        selectCompany(el.dataset.key);
+        document.getElementById('main').scrollIntoView({behavior:'smooth', block:'start'});
+      });
+    });
+    const btn = document.getElementById('showAllPosBtn');
+    if(btn) btn.addEventListener('click', loadAllPositiveNews);
+  }
 
   function renderTrendPanel(prefix, data){
     const body = document.getElementById(prefix+'Body');
