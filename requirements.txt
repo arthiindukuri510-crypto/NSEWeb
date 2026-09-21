@@ -1,9 +1,5 @@
 flask
-flask-socketio
-gevent
-gevent-websocket
 pandas
 openpyxl
 requests
 gunicorn
-packaging
