@@ -719,31 +719,6 @@ def api_positive_news():
         for _, row in pos.iterrows()
     ])
 
-
-# ----------------- TEMPORARY DEBUG ROUTE - DELETE AFTER FIXING -----------------
-@app.route("/debug-sheet")
-def debug_sheet():
-    """Makes the same call as registration and shows the real result on screen.
-    Never prints the secret or the full URL. Remove this route once login works."""
-    info = {
-        "url_set": bool(APPS_SCRIPT_URL),
-        "url_starts_ok": APPS_SCRIPT_URL.startswith("https://script.google.com/macros/s/"),
-        "url_ends_exec": APPS_SCRIPT_URL.endswith("/exec"),
-        "secret_length": len(APPS_SCRIPT_SECRET),
-    }
-    try:
-        r = requests.post(
-            APPS_SCRIPT_URL,
-            json={"action": "find", "kind": "name", "identifier": "test", "secret": APPS_SCRIPT_SECRET},
-            timeout=25,
-        )
-        info.update(status=r.status_code, final_url=r.url[:45], body=r.text[:300])
-    except Exception as e:
-        info["exception"] = repr(e)
-    return jsonify(info)
-# -------------------------------------------------------------------------------
-
-
 if __name__ == "__main__":
     # Render (and most hosts) set PORT for you and expect the app to
     # bind 0.0.0.0. debug=True is a security risk on a public server
