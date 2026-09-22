@@ -57,16 +57,28 @@ DEPLOYMENT NOTE (Render / gunicorn)
   This is now a plain synchronous Flask app - no WebSocket, no
   background thread. Any standard gunicorn setup works, e.g.:
       gunicorn -w 2 app:app
-  requirements.txt only needs: flask, pandas, openpyxl, gunicorn, requests.
+  requirements.txt needs: flask, pandas, openpyxl, gunicorn, requests,
+  firebase-admin.
 
 LOGIN
   Admin (password only) sees everything; registered users see only the
   3-Day / 5-Day Rising tables. User accounts live in a Google Sheet behind
   an Apps Script (see UserAuth_AppsScript.gs). Set SECRET_KEY,
   ADMIN_PASSWORD, APPS_SCRIPT_URL and APPS_SCRIPT_SECRET in Render.
+
+PHONE VERIFICATION (Firebase)
+  Registration requires a verified phone number via Firebase Phone Auth
+  (project: Flumagic). The register page (login.html) sends OTP via the
+  Firebase JS SDK and includes the resulting ID token as "firebase_token"
+  in the /api/register payload. This server verifies that token with the
+  firebase-admin SDK and cross-checks the phone number before writing to
+  the Sheet. Set FIREBASE_SERVICE_ACCOUNT_JSON in Render (paste the full
+  contents of the service-account key file downloaded from Firebase
+  Project Settings -> Service accounts -> Generate new private key).
 """
 
 import hmac
+import json
 import os
 import re
 import time
@@ -78,6 +90,10 @@ import pandas as pd
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import firebase_admin
+from firebase_admin import credentials as fb_credentials
+from firebase_admin import auth as firebase_auth
 
 # ======================= CONFIG - EDIT THESE =======================
 # By default everything is read from a "data" folder next to this file,
@@ -103,10 +119,11 @@ app = Flask(__name__)
 
 # ============================ LOGIN / ROLES ============================
 # Set these in Render -> your service -> Environment (never hard-code them):
-#   SECRET_KEY          long random text - signs the login cookie
-#   ADMIN_PASSWORD      the admin's password
-#   APPS_SCRIPT_URL     the Google Apps Script web-app URL (ends in /exec)
-#   APPS_SCRIPT_SECRET  same text as API_SECRET in the Apps Script
+#   SECRET_KEY                     long random text - signs the login cookie
+#   ADMIN_PASSWORD                 the admin's password
+#   APPS_SCRIPT_URL                the Google Apps Script web-app URL (ends in /exec)
+#   APPS_SCRIPT_SECRET             same text as API_SECRET in the Apps Script
+#   FIREBASE_SERVICE_ACCOUNT_JSON  full contents of the Flumagic service-account key
 #
 # ADMIN -> everything.   USER -> only the 3-Day / 5-Day Rising tables.
 def _env(name):
@@ -122,20 +139,22 @@ def _env(name):
     return (val or "").strip()
 
 
-SECRET_KEY         = _env("SECRET_KEY")
-ADMIN_PASSWORD     = _env("ADMIN_PASSWORD")
-APPS_SCRIPT_URL    = _env("APPS_SCRIPT_URL")
-APPS_SCRIPT_SECRET = _env("APPS_SCRIPT_SECRET")
+SECRET_KEY                    = _env("SECRET_KEY")
+ADMIN_PASSWORD                = _env("ADMIN_PASSWORD")
+APPS_SCRIPT_URL               = _env("APPS_SCRIPT_URL")
+APPS_SCRIPT_SECRET            = _env("APPS_SCRIPT_SECRET")
+FIREBASE_SERVICE_ACCOUNT_JSON = _env("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 # names (never values) of any setting that looks related, so a typo in a NAME shows up in the Logs
 print("[env names] " + ", ".join(sorted(
-    repr(k) for k in os.environ if any(w in k.upper() for w in ("APPS", "SCRIPT", "SECRET", "ADMIN")))))
+    repr(k) for k in os.environ if any(w in k.upper() for w in ("APPS", "SCRIPT", "SECRET", "ADMIN", "FIREBASE")))))
 
 # one line in the Render Logs showing which settings are present (values are never printed)
 print("[login config] " + ", ".join(
     f"{n}={'set' if v else 'MISSING'}" for n, v in [
         ("SECRET_KEY", SECRET_KEY), ("ADMIN_PASSWORD", ADMIN_PASSWORD),
         ("APPS_SCRIPT_URL", APPS_SCRIPT_URL), ("APPS_SCRIPT_SECRET", APPS_SCRIPT_SECRET),
+        ("FIREBASE_SERVICE_ACCOUNT_JSON", FIREBASE_SERVICE_ACCOUNT_JSON),
     ]))
 
 IS_HOSTED = "PORT" in os.environ
@@ -151,6 +170,39 @@ app.config.update(
     SESSION_COOKIE_SECURE=IS_HOSTED,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
+
+# ------------------------- Firebase Admin (phone verification) -------------------------
+_FIREBASE_READY = False
+if FIREBASE_SERVICE_ACCOUNT_JSON:
+    try:
+        _cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+        firebase_admin.initialize_app(fb_credentials.Certificate(_cred_dict))
+        _FIREBASE_READY = True
+    except Exception as e:
+        print(f"[warn] could not initialize Firebase Admin: {e}")
+else:
+    print("[warn] FIREBASE_SERVICE_ACCOUNT_JSON not set - phone verification on register will fail.")
+
+
+def verify_firebase_phone(id_token, expected_phone_10digit):
+    """Verify a Firebase ID token from the register page's OTP flow and
+    confirm it belongs to the phone number the user typed. Returns
+    (ok: bool, error: str|None)."""
+    if not _FIREBASE_READY:
+        return False, "Phone verification is not set up on the server yet."
+    if not id_token:
+        return False, "Phone number is not verified. Please request and enter the OTP."
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        return False, "Phone verification failed or expired. Please request a new OTP."
+
+    verified_phone = decoded.get("phone_number", "")  # e.g. "+919876543210"
+    verified_10digit = clean_phone(verified_phone)
+    if not verified_10digit or verified_10digit != expected_phone_10digit:
+        return False, "The verified phone number does not match the one entered."
+    return True, None
+
 
 # used so a wrong name and a wrong password take the same time to reject
 _DUMMY_HASH = generate_password_hash("not-a-real-password")
@@ -496,6 +548,7 @@ def api_register():
     phone = clean_phone(d.get("phone", ""))
     pw = str(d.get("password", ""))
     confirm = str(d.get("confirm", ""))
+    firebase_token = str(d.get("firebase_token", ""))
 
     if not (2 <= len(name) <= 40) or not re.search(r"[^\W\d_]", name):
         return jsonify({"ok": False, "error": "Enter your name (2-40 characters, with letters)."}), 400
@@ -505,6 +558,11 @@ def api_register():
         return jsonify({"ok": False, "error": "Password must be 6 to 64 characters."}), 400
     if pw != confirm:
         return jsonify({"ok": False, "error": "Passwords do not match."}), 400
+
+    # phone must be verified via Firebase OTP before we touch the Sheet
+    verified, verify_error = verify_firebase_phone(firebase_token, phone)
+    if not verified:
+        return jsonify({"ok": False, "error": verify_error}), 401
 
     # only a salted hash ever leaves this server - never the password itself
     res = call_sheet({"action": "add", "name": name, "phone": phone, "hash": generate_password_hash(pw)})
